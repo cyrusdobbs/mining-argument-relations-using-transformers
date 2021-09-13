@@ -44,11 +44,11 @@ if _has_sklearn:
         logger.info("LABELS: {} \nPREDS: {}".format(str(labels), str(preds)))
         f1_micro = f1_score(labels, preds, labels=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], average='micro')
         f1_macro = f1_score(labels, preds, average='macro')
-        f1_policy = f1_score(labels, preds, labels=[1,2], average='micro')
-        f1_value = f1_score(labels, preds, labels=[3,4], average='micro')
-        f1_testimony = f1_score(labels, preds, labels=[5,6], average='micro')
-        f1_fact = f1_score(labels, preds, labels=[7,8], average='micro')
-        f1_reference = f1_score(labels, preds, labels=[9,10], average='micro')
+        f1_policy = f1_score(labels, preds, labels=[1, 2], average='micro')
+        f1_value = f1_score(labels, preds, labels=[3, 4], average='micro')
+        f1_testimony = f1_score(labels, preds, labels=[5, 6], average='micro')
+        f1_fact = f1_score(labels, preds, labels=[7, 8], average='micro')
+        f1_reference = f1_score(labels, preds, labels=[9, 10], average='micro')
 
         return {
             #"acc": acc,
@@ -81,22 +81,76 @@ if _has_sklearn:
             #"acc_and_f1": (acc + f1) / 2,
         }
 
-    def f1_scores(y_pred, y_true, labelfilter=None):
+    def f1_scores(y_pred, y_true):
 
-        f1_micro_filtered = f1_score(y_true, y_pred, labels=labelfilter, average='micro')
-        f1_macro_filtered = f1_score(y_true, y_pred, labels=labelfilter, average='macro')
         f1_micro = f1_score(y_true, y_pred, average='micro')
         f1_macro = f1_score(y_true, y_pred, average='macro')
+
+        f1_none = f1_score(y_true, y_pred, labels=[0], average=None)[0]
+        f1_reason = f1_score(y_true, y_pred, labels=[1], average=None)[0]
+        f1_evidence = f1_score(y_true, y_pred, labels=[2], average=None)[0]
 
         clf_report = classification_report(y_true, y_pred)
 
         return {
-            "eval_f1_micro_filtered": f1_micro_filtered,
-            "eval_f1_macro_filtered": f1_macro_filtered,
             'eval_f1_micro': f1_micro,
             'eval_f1_macro': f1_macro,
+            'eval_f1_none': f1_none,
+            'eval_f1_reason': f1_reason,
+            'eval_f1_evidence': f1_evidence,
             'clf_report': clf_report
         }
+
+    def f1_scores_inv(y_pred, y_true):
+
+        f1_reason_inv = f1_score(y_true, y_pred, labels=[2], average='macro')
+        f1_evidence_inv = f1_score(y_true, y_pred, labels=[4], average='macro')
+
+        replace = {0: 0,
+                   1: 1,
+                   2: 0,
+                   3: 2,
+                   4: 0}
+
+        y_true = [replace[x] for x in y_true]
+        y_pred = [replace[x] for x in y_pred]
+
+        # f1_micro_filtered = f1_score(y_true, y_pred, labels=labelfilter, average='micro')
+        # f1_macro_filtered = f1_score(y_true, y_pred, labels=labelfilter, average='macro')
+        f1_micro = f1_score(y_true, y_pred, labels=[0, 1, 2], average='micro')
+        f1_macro = f1_score(y_true, y_pred, labels=[0, 1, 2], average='macro')
+
+        f1_none = f1_score(y_true, y_pred, labels=[0], average=None)[0]
+        f1_reason = f1_score(y_true, y_pred, labels=[1], average=None)[0]
+        f1_evidence = f1_score(y_true, y_pred, labels=[2], average=None)[0]
+
+        clf_report = classification_report(y_true, y_pred)
+
+        return {
+            'eval_f1_micro': f1_micro,
+            'eval_f1_macro': f1_macro,
+            'eval_f1_none': f1_none,
+            'eval_f1_reason': f1_reason,
+            'eval_f1_evidence': f1_evidence,
+            'eval_f1_r_inv': f1_reason_inv,
+            'eval_f1_e_inv': f1_evidence_inv,
+            'clf_report': clf_report
+        }
+
+    def f1_scores_components(y_true, y_pred, comp_set):
+
+        f1_macro = f1_score(y_true, y_pred, labels=[0, 1, 2, 3, 4], average='macro')
+        all_f1s = f1_score(y_true, y_pred, labels=[0, 1, 2, 3, 4], average=None)
+
+        return {
+            comp_set + 'f1_macro': f1_macro,
+            comp_set + 'f1_policy': all_f1s[0],
+            comp_set + 'f1_fact': all_f1s[1],
+            comp_set + 'f1_testimony': all_f1s[2],
+            comp_set + 'f1_value': all_f1s[3],
+            comp_set + 'f1_reference': all_f1s[4],
+        }
+
 
 
     def pearson_and_spearman(preds, labels):
@@ -116,28 +170,29 @@ if _has_sklearn:
         else:
             raise KeyError(task_name)
 
+
+    f1_scores_tasks = ["relclass", "cdcp_relclass", "cdcp_relclass_context", "cdcp_relclass_rbert",
+                       "cdcp_relclass_rbert_jl", "cdcp_relclass_distance", "cdcp_relclass_distance_components",
+                       "cdcp_relclass_resnet", "cdcp_relclass_resnet_jl", "multichoice", "outcomeclf"]
+
+    f1_scores_tasks_inverse = ["cdcp_relclass_resnet_jl_inv", "cdcp_relclass_jl_inv"]
+
     def compute_metrics(task_name, y_pred, y_true):
         assert len(y_pred) == len(y_true)
-        if task_name == "seqtag":
-            return acc_and_f1(y_pred, y_true)
+
+        if task_name in f1_scores_tasks:
+            return f1_scores(y_pred, y_true)
         elif task_name == "cdcp_seqtag":
             return acc_and_f1_cdcp(y_pred, y_true)
-        elif task_name == "relclass":
-            return f1_scores(y_pred, y_true, [0, 1])
-        elif task_name == "cdcp_relclass":
-            return f1_scores(y_pred, y_true, [0, 1])
-        elif task_name == "cdcp_relclass_context":
-            return f1_scores(y_pred, y_true, [0, 1])
-        elif task_name == "cdcp_relclass_rbert":
-            return f1_scores(y_pred, y_true, [0, 1])
-        elif task_name == "cdcp_relclass_distance":
-            return f1_scores(y_pred, y_true, [0, 1])
-        elif task_name == "cdcp_relclass_distance_components":
-            return f1_scores(y_pred, y_true, [0, 1])
-        elif task_name == "outcomeclf":
-            return f1_scores(y_pred, y_true)
-        elif task_name == "multichoice":
-            return f1_scores(y_pred, y_true, [0, 1])
+        elif task_name in f1_scores_tasks_inverse:
+            return f1_scores_inv(y_pred, y_true)
+        elif task_name == "MTL-source":
+            return f1_scores_components(y_pred, y_true, 'source')
+        elif task_name == "MTL-target":
+            return f1_scores_components(y_pred, y_true, 'target')
+
+        elif task_name == "seqtag":
+            return acc_and_f1(y_pred, y_true)
         else:
             raise KeyError(task_name)
 

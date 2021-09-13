@@ -36,7 +36,12 @@ class CDCPArgumentationDoc:
             merge_spans(self)
 
         self.links = _transitive(self.links)
+        link_dict = {a: [] for (a, b, l_type) in self.links}
+        for (a, b, l_type) in self.links:
+            link_dict[a] += [{'link': b, 'type': l_type}]
         self.links_dict = {a: {'link': b, 'type': l_type} for (a, b, l_type) in self.links}
+        self.links_lists = {'locate': [(src, trg) for (src, trg, l_type) in self.links],
+                            'link':   [l_type for (src, trg, l_type) in self.links]}
         self.reasons = [(a, b) for (a, b, l_type) in self.links if l_type == 'reason']
         self.evidences = [(a, b) for (a, b, l_type) in self.links if l_type == 'evidence']
 

@@ -25,6 +25,9 @@ import random
 
 import numpy as np
 import torch
+from datetime import datetime
+
+import torchvision
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm, trange
@@ -42,14 +45,19 @@ from transformers import (
     RobertaTokenizer,
     get_linear_schedule_with_warmup,
 )
-from utils.data_processors import output_modes
+from utils.data_processors import output_modes, SEQUENCE_TAGGING, REGRESSION, CLASSIFICATION
 from utils.data_processors import processors
 from utils.models import BertForSequenceTagging, RBERT, BertForSequenceClassificationWithDistance, \
     BertForSequenceClassificationWithDistanceAndComponentType, \
-    BertForSequenceClassificationWithDistanceAndComponentTypeNew
+    BertForSequenceClassificationWithDistanceAndComponentTypeNew, BertForSequenceClassificationResNet, \
+    BertForSequenceClassificationResNetJointLearning, BertForSequenceClassificationCDCP, \
+    RobertaForSequenceClassificationCDCP, BertForSequenceClassificationCDCPJointLearning, RBERTJointLearning, \
+    RBERTJointLearningV2
 from utils.metrics import compute_metrics
 from utils.tokenizer import ExtendedBertTokenizer
 from torch.utils.tensorboard import SummaryWriter
+
+ADDITIONAL_SPECIAL_TOKENS = ['<src>', '</src>', '<trg>', '</trg>']
 
 logger = logging.getLogger(__name__)
 
@@ -67,17 +75,19 @@ ALL_MODELS = sum(
 )
 
 MODEL_CLASSES = {
-    "bert": (BertConfig, BertForSequenceClassification, BertTokenizer),
+    "bert": (BertConfig, BertForSequenceClassificationCDCP, BertTokenizer),
+    "bert-jl": (BertConfig, BertForSequenceClassificationCDCPJointLearning, BertTokenizer),
     "bert-rbert": (BertConfig, RBERT, BertTokenizer),
+    "bert-rbert-jl": (BertConfig, RBERTJointLearning, BertTokenizer),
+    "bert-rbert-jl-2": (BertConfig, RBERTJointLearningV2, BertTokenizer),
     "bert-distance": (BertConfig, BertForSequenceClassificationWithDistance, BertTokenizer),
     "bert-distance-components": (BertConfig, BertForSequenceClassificationWithDistanceAndComponentType, BertTokenizer),
     "bert-distance-components-new": (BertConfig, BertForSequenceClassificationWithDistanceAndComponentTypeNew, BertTokenizer),
-    "roberta": (RobertaConfig, RobertaForSequenceClassification, RobertaTokenizer),
+    "bert-resnet": (BertConfig, BertForSequenceClassificationResNet, BertTokenizer),
+    "bert-resnet-jl": (BertConfig, BertForSequenceClassificationResNetJointLearning, BertTokenizer),
+    "roberta": (RobertaConfig, RobertaForSequenceClassificationCDCP, RobertaTokenizer),
     "bert-seqtag": (BertConfig, BertForSequenceTagging, ExtendedBertTokenizer),
 }
-
-# ADDITIONAL_SPECIAL_TOKENS = ["<e1>", "</e1>", "<e2>", "</e2>"]
-ADDITIONAL_SPECIAL_TOKENS = ['<src>', '</src>', '<trg>', '</trg>']
 
 
 def set_seed(args):
@@ -90,10 +100,20 @@ def set_seed(args):
 
 def train(args, train_dataset, model, tokenizer):
     """ Train the model """
-    if args.local_rank in [-1, 0]:
-        tb_writer = SummaryWriter()
-
     args.train_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu)
+
+    if args.local_rank in [-1, 0]:
+        now = datetime.now()
+        tb_writer = SummaryWriter(
+            log_dir="runs/{}/{}+{}+{}+{}+{}+LR{}+WD{}+FZ{}+EP{}+BS{}+{}".format(args.task_name, now.strftime("%d-%m_%H-%M-%S"), args.model_type,
+                                                                args.classifier_type, args.task_name,
+                                                                args.max_seq_length, args.learning_rate,
+                                                                args.weight_decay,
+                                                                args.freeze_bert, args.num_train_epochs, args.train_batch_size,
+                                                                             args.loss_weights))
+
+    tb_writer.add_text("loss_weights", str(args.loss_weights))
+
     train_sampler = RandomSampler(train_dataset) if args.local_rank == -1 else DistributedSampler(train_dataset)
     train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size)
 
@@ -112,6 +132,11 @@ def train(args, train_dataset, model, tokenizer):
         },
         {"params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], "weight_decay": 0.0},
     ]
+
+    logger.info("{} params with {} WD".format(len(optimizer_grouped_parameters[0]["params"]),
+                                              optimizer_grouped_parameters[0]["weight_decay"]))
+
+    start_average_weight = torch.mean(torch.tensor([torch.norm(p) for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)]))
 
     optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
     scheduler = get_linear_schedule_with_warmup(
@@ -145,6 +170,7 @@ def train(args, train_dataset, model, tokenizer):
 
     # Train!
     logger.info("***** Running training *****")
+    logger.info("  Evaluate during training = {}".format(args.evaluate_during_training))
     logger.info("  Num examples = %d", len(train_dataset))
     logger.info("  Num Epochs = %d", args.num_train_epochs)
     logger.info("  Instantaneous batch size per GPU = %d", args.per_gpu_train_batch_size)
@@ -219,24 +245,8 @@ def train(args, train_dataset, model, tokenizer):
                 global_step += 1
 
                 if args.local_rank in [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
-                    logs = {}
-                    if (
-                        args.local_rank == -1 and args.evaluate_during_training
-                    ):  # Only evaluate when single GPU otherwise metrics may not average well
-                        results = evaluate(args, model, tokenizer)
-                        for key, value in results.items():
-                            eval_key = "eval_{}".format(key)
-                            logs[eval_key] = value
-
-                    loss_scalar = (tr_loss - logging_loss) / args.logging_steps
-                    learning_rate_scalar = scheduler.get_lr()[0]
-                    logs["learning_rate"] = learning_rate_scalar
-                    logs["loss"] = loss_scalar
-                    logging_loss = tr_loss
-
-                    for key, value in logs.items():
-                        tb_writer.add_scalar(key, value, global_step)
-                    print(json.dumps({**logs, **{"step": global_step}}))
+                    logging_loss = log_and_evaluate(args, global_step, logging_loss, model, scheduler, tb_writer, tokenizer, tr_loss,
+                                     dataset_type='dev')
 
                 if args.local_rank in [-1, 0] and args.save_steps > 0 and global_step % args.save_steps == 0:
                     # Save model checkpoint
@@ -259,24 +269,51 @@ def train(args, train_dataset, model, tokenizer):
             if args.max_steps > 0 and global_step > args.max_steps:
                 epoch_iterator.close()
                 break
+
+        log_and_evaluate(args, global_step, logging_loss, model, scheduler, tb_writer, tokenizer, tr_loss,
+                         dataset_type='train')
         if args.max_steps > 0 and global_step > args.max_steps:
             train_iterator.close()
             break
 
-    if args.local_rank in [-1, 0]:
-        tb_writer.close()
+    end_average_weight = torch.mean(torch.tensor([torch.norm(p) for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)]))
+    logger.info("Average weights {} -> {} in {} steps with {} WD.".format(start_average_weight, end_average_weight, global_step, args.weight_decay))
 
-    return global_step, tr_loss / global_step
+    return global_step, tr_loss / global_step, tb_writer
 
 
-def evaluate(args, model, tokenizer, prefix=""):
+def log_and_evaluate(args, global_step, logging_loss, model, scheduler, tb_writer, tokenizer, tr_loss, dataset_type):
+    logs = {}
+    if (
+            args.local_rank == -1 and args.evaluate_during_training
+    ):  # Only evaluate when single GPU otherwise metrics may not average well
+        results = evaluate(args, model, tokenizer, dataset_type)
+        for key, value in results.items():
+            eval_key = dataset_type + "_{}".format(key)
+            logs[eval_key] = value
+
+    if dataset_type == 'dev':  # only log the loss if dev log
+        loss_scalar = (tr_loss - logging_loss) / args.logging_steps
+        logs["loss"] = loss_scalar
+
+    learning_rate_scalar = scheduler.get_lr()[0]
+    logs["learning_rate"] = learning_rate_scalar
+
+    for key, value in logs.items():
+        if key != dataset_type + '_clf_report':
+            tb_writer.add_scalar(key, value, global_step)
+    print(json.dumps({**logs, **{"step": global_step}}))
+    return tr_loss
+
+
+def evaluate(args, model, tokenizer, dataset_type, prefix=""):
     # Loop to handle MNLI double evaluation (matched, mis-matched)
     eval_task_names = (args.task_name,)
     eval_outputs_dirs = (args.output_dir,)
 
     results = {}
     for eval_task, eval_output_dir in zip(eval_task_names, eval_outputs_dirs):
-        eval_dataset = load_and_cache_examples(args, eval_task, tokenizer, evaluate=True)
+        eval_dataset = load_and_cache_examples(args, eval_task, tokenizer, dataset_type=dataset_type)
 
         if not os.path.exists(eval_output_dir) and args.local_rank in [-1, 0]:
             os.makedirs(eval_output_dir)
@@ -297,6 +334,8 @@ def evaluate(args, model, tokenizer, prefix=""):
         eval_loss = 0.0
         nb_eval_steps = 0
         preds = None
+        source_preds = None
+        target_preds = None
         out_label_ids = None
         processor = processors[args.task_name]()
 
@@ -315,7 +354,7 @@ def evaluate(args, model, tokenizer, prefix=""):
 
                 outputs = model(**inputs)
 
-                if args.output_mode == "sequencetagging":
+                if args.output_mode == SEQUENCE_TAGGING:
                     tmp_eval_loss, emissions, path = outputs[:3]
                     logits_tensor = path.detach().cpu().numpy()
                     labels_tensor = inputs["labels"].detach().cpu().numpy()
@@ -327,7 +366,18 @@ def evaluate(args, model, tokenizer, prefix=""):
                 else:
                     tmp_eval_loss, logits = outputs[:2]
                     logits = logits.detach().cpu().numpy()
-                    labels = inputs["labels"].detach().cpu().numpy()
+                    if "labels" in inputs:
+                        labels = inputs["labels"].detach().cpu().numpy()
+                    else:
+                        labels = inputs["relation_labels"].detach().cpu().numpy()
+
+                    if len(outputs) > 2:
+                        source_logits, target_logits = outputs[2:]
+                        source_logits = source_logits.detach().cpu().numpy()
+                        target_logits = target_logits.detach().cpu().numpy()
+
+                        source_labels = inputs["source_labels"].detach().cpu().numpy()
+                        target_labels = inputs["target_labels"].detach().cpu().numpy()
 
                 eval_loss += tmp_eval_loss.mean().item()
             nb_eval_steps += 1
@@ -338,20 +388,59 @@ def evaluate(args, model, tokenizer, prefix=""):
                 preds = np.append(preds, logits, axis=0)
                 out_label_ids = np.append(out_label_ids, labels, axis=0)
 
+            if len(outputs) > 2 and args.output_mode != SEQUENCE_TAGGING:
+                if source_preds is None:
+                    source_preds = source_logits
+                    out_source_label_ids = source_labels
+                else:
+                    source_preds = np.append(source_preds, source_logits, axis=0)
+                    out_source_label_ids = np.append(out_source_label_ids, source_labels, axis=0)              
+                
+                if target_preds is None:
+                    target_preds = target_logits
+                    out_target_label_ids = target_labels
+                else:
+                    target_preds = np.append(target_preds, target_logits, axis=0)
+                    out_target_label_ids = np.append(out_target_label_ids, target_labels, axis=0)
+
         eval_loss = eval_loss / nb_eval_steps
-        if args.output_mode == "classification":
+        if args.output_mode == CLASSIFICATION:
             preds = np.argmax(preds, axis=1)
-        elif args.output_mode == "regression":
+        elif args.output_mode == REGRESSION:
             preds = np.squeeze(preds)
         result = compute_metrics(eval_task, preds, out_label_ids)
+        result["eval_loss"] = eval_loss
+
+        if len(outputs) > 2 and args.output_mode != SEQUENCE_TAGGING:
+            source_preds = np.argmax(source_preds, axis=1)
+            target_preds = np.argmax(target_preds, axis=1)
+            result.update(compute_metrics('MTL-source', source_preds, out_source_label_ids))
+            result.update(compute_metrics('MTL-target', target_preds, out_target_label_ids))
+
         results.update(result)
 
         output_eval_file = os.path.join(eval_output_dir, prefix, "eval_results.txt")
         with open(output_eval_file, "w") as writer:
-            logger.info("***** Eval results {} *****".format(prefix))
+            logger.info("***** Eval results {} on {} set *****".format(prefix, dataset_type))
             for key in sorted(result.keys()):
                 logger.info("  %s = %s", key, str(result[key]))
                 writer.write("%s = %s\n" % (key, str(result[key])))
+
+        output_eval_file = os.path.join(eval_output_dir, prefix, "eval_relation_preds.txt")
+        with open(output_eval_file, "w") as writer:
+            for p in preds:
+                writer.write(str(p))
+
+        if len(outputs) > 2 and args.output_mode != SEQUENCE_TAGGING:
+            output_eval_file = os.path.join(eval_output_dir, prefix, "eval_source_preds.txt")
+            with open(output_eval_file, "w") as writer:
+                for p in source_preds:
+                    writer.write(str(p))
+
+            output_eval_file = os.path.join(eval_output_dir, prefix, "eval_target_preds.txt")
+            with open(output_eval_file, "w") as writer:
+                for p in target_preds:
+                    writer.write(str(p))
 
     return results
 
@@ -360,13 +449,25 @@ def get_inputs(args, batch):
     if args.model_type == "bert-rbert":
         inputs = {"input_ids": batch[0], "attention_mask": batch[1], "token_type_ids": batch[2],
                   "labels": batch[3], "e1_mask": batch[4], "e2_mask": batch[5]}
+    elif args.model_type in ["bert-rbert-jl", "bert-rbert-jl-2"]:
+        inputs = {"input_ids": batch[0], "attention_mask": batch[1], "token_type_ids": batch[2],
+                  "e1_mask": batch[3], "e2_mask": batch[4], "relation_labels": batch[5],
+                  "source_labels": batch[6], "target_labels": batch[7]}
+    elif args.model_type == "bert-resnet-jl":
+        inputs = {"input_ids": batch[0], "attention_mask": batch[1], "token_type_ids": batch[2],
+                  "distance_encoding": batch[3], "relation_labels": batch[4], "link_labels": batch[5],
+                  "source_labels": batch[6], "target_labels": batch[7]}
+    elif args.model_type == "bert-jl":
+        inputs = {"input_ids": batch[0], "attention_mask": batch[1], "token_type_ids": batch[2],
+                  "relation_labels": batch[3], "link_labels": batch[4],
+                  "source_labels": batch[5], "target_labels": batch[6]}
     else:
         inputs = {"input_ids": batch[0], "attention_mask": batch[1], "labels": batch[3]}
         if args.model_type != "distilbert":
             inputs["token_type_ids"] = (
                 batch[2] if args.model_type in ["bert", "xlnet", "albert"] else None
             )  # XLM, DistilBERT, RoBERTa, and XLM-RoBERTa don't use segment_ids
-        if args.model_type == "bert-distance":
+        if args.model_type in ["bert-distance", "bert-resnet"]:
             inputs["distance_encoding"] = batch[4]
         if args.model_type in ["bert-distance-components", "bert-distance-components-new"]:
             inputs["distance_encoding"] = batch[4]
@@ -374,8 +475,8 @@ def get_inputs(args, batch):
     return inputs
 
 
-def load_and_cache_examples(args, task, tokenizer, evaluate=False):
-    if args.local_rank not in [-1, 0] and not evaluate:
+def load_and_cache_examples(args, task, tokenizer, dataset_type="train"):
+    if args.local_rank not in [-1, 0] and dataset_type != 'dev':
         torch.distributed.barrier()  # Make sure only the first process in distributed training process the dataset, and the others will use the cache
 
     processor = processors[task]()
@@ -384,7 +485,7 @@ def load_and_cache_examples(args, task, tokenizer, evaluate=False):
     cached_features_file = os.path.join(
         args.data_dir,
         "cached_{}_{}_{}_{}".format(
-            "dev" if evaluate else "train",
+            dataset_type,
             list(filter(None, args.model_name_or_path.split("/"))).pop(),
             str(args.max_seq_length),
             str(task),
@@ -396,10 +497,12 @@ def load_and_cache_examples(args, task, tokenizer, evaluate=False):
     else:
         logger.info("Creating features from dataset file at %s", args.data_dir)
         examples = (
-            processor.get_dev_examples(args.data_dir) if evaluate and args.do_train else processor.get_test_examples(args.data_dir) if evaluate else processor.get_train_examples(args.data_dir)
+            processor.get_dev_examples(
+                args.data_dir) if dataset_type == 'dev' and args.do_train else processor.get_test_examples(
+                args.data_dir) if dataset_type == 'dev' else processor.get_train_examples(args.data_dir)
         )
 
-        if args.output_mode == "sequencetagging":
+        if args.output_mode == SEQUENCE_TAGGING:
             forSequenceTagging = True
         else:
             forSequenceTagging = False
@@ -410,7 +513,7 @@ def load_and_cache_examples(args, task, tokenizer, evaluate=False):
             logger.info("Saving features into cached file %s", cached_features_file)
             torch.save(features, cached_features_file)
 
-    if args.local_rank == 0 and not evaluate:
+    if args.local_rank == 0 and dataset_type != 'dev':
         torch.distributed.barrier()  # Make sure only the first process in distributed training process the dataset, and the others will use the cache
 
     # Convert to Tensors and build dataset
@@ -419,51 +522,143 @@ def load_and_cache_examples(args, task, tokenizer, evaluate=False):
     return dataset
 
 
-def main():
+def main(space=None):
     parser = argparse.ArgumentParser()
 
     # Required parameters
+
+    if space:
+        parser.add_argument(
+            "--model_type",
+            default=space['model_specific']['model_type'],
+            type=str,
+            required=False,
+            help="Model type selected in the list: " + ", ".join(MODEL_CLASSES.keys()),
+        )
+
+        parser.add_argument(
+            "--classifier_type",
+            default=space['model_specific']['classifier_type'] if 'classifier_type' in space[
+                'model_specific'] else None,
+            type=str,
+            required=False,
+            help="Model type selected in the list: " + ", ".join(['FC', '2FC', 'FC-RelU', 'FC-Tanh', 'FC-DO']),
+        )
+
+        parser.add_argument(
+            "--model_name_or_path",
+            default="bert-base-uncased",
+            type=str,
+            required=False,
+            help="Path to pre-trained model or shortcut name selected in the list: " + ", ".join(ALL_MODELS),
+        )
+        parser.add_argument(
+            "--task_name",
+            default=space['model_specific']['task_name'],
+            type=str,
+            required=False,
+            help="The name of the task to train selected in the list: " + ", ".join(processors.keys()),
+        )
+        output_dir = 'output/'+'{}+{}+{}+{}+{}+{}+{}'.format(space['model_specific']['model_type'],
+                                                             space['model_specific']['classifier_type'] if 'classifier_type' in space['model_specific'] else "",
+                                                             space['model_specific']['model_type'],
+                                                             space['max_seq_length'],
+                                                             list(space['freeze_bert'])[0],
+                                                             space['weight_decay'],
+                                                             space['learning_rate'])
+        parser.add_argument(
+            "--output_dir",
+            default=output_dir,
+            type=str,
+            required=False,
+            help="The output directory where the model predictions and checkpoints will be written.",
+        )
+        parser.add_argument(
+            "--max_seq_length",
+            default=space['max_seq_length'],
+            type=int,
+            help="The maximum total input sequence length after tokenization. Sequences longer "
+                 "than this will be truncated, sequences shorter will be padded.",
+        )
+        parser.add_argument(
+            "--loss_weights",
+            default=space['loss_weights'],
+            type=list,
+            help="Weights for each class in the loss function",
+        )
+        parser.add_argument("--freeze_bert", default=list(space['freeze_bert'].values())[0], type=bool,
+                            help="Freeze BERT weights.")
+        parser.add_argument("--learning_rate", default=space['learning_rate'], type=float,
+                            help="The initial learning rate for Adam.")
+        parser.add_argument("--weight_decay", default=space['weight_decay'], type=float,
+                            help="Weight decay if we apply some.")
+        parser.add_argument("--num_train_epochs", default=list(space['freeze_bert'].values())[1], type=float,
+                            help="Total number of training epochs to perform.")
+
+    else:
+        parser.add_argument(
+            "--model_type",
+            default=None,
+            type=str,
+            required=True,
+            help="Model type selected in the list: " + ", ".join(MODEL_CLASSES.keys()),
+        )
+        parser.add_argument(
+            "--classifier_type",
+            default=None,
+            type=str,
+            required=False,
+            help="Model type selected in the list: " + ", ".join(['FC', '2FC', 'FC-RelU', 'FC-Tanh', 'FC-DO']),
+        )
+        parser.add_argument(
+            "--model_name_or_path",
+            default=None,
+            type=str,
+            required=True,
+            help="Path to pre-trained model or shortcut name selected in the list: " + ", ".join(ALL_MODELS),
+        )
+        parser.add_argument(
+            "--task_name",
+            default=None,
+            type=str,
+            required=True,
+            help="The name of the task to train selected in the list: " + ", ".join(processors.keys()),
+        )
+        parser.add_argument(
+            "--output_dir",
+            default=None,
+            type=str,
+            required=True,
+            help="The output directory where the model predictions and checkpoints will be written.",
+        )
+        parser.add_argument(
+            "--max_seq_length",
+            default=128,
+            type=int,
+            help="The maximum total input sequence length after tokenization. Sequences longer "
+                 "than this will be truncated, sequences shorter will be padded.",
+        )
+        parser.add_argument(
+            "--loss_weights",
+            nargs="*",
+            default=[1.0, 1.0, 1.0],
+            type=float,
+            help="Weights for each class in the loss function",
+        )
+        parser.add_argument("--final_evaluation", default=0, type=int, help="Carrying out final evaluation - include IDs with examples.")
+        parser.add_argument("--freeze_bert", default=0, type=int, help="Freeze BERT weights.")
+        parser.add_argument("--learning_rate", default=5e-5, type=float, help="The initial learning rate for Adam.")
+        parser.add_argument("--weight_decay", default=0.0, type=float, help="Weight decay if we apply some.")
+        parser.add_argument(
+            "--num_train_epochs", default=3.0, type=float, help="Total number of training epochs to perform.",
+        )
+
     parser.add_argument(
         "--data_dir",
         default=None,
         type=str,
         required=True,
         help="The input data dir. Should contain the .tsv files (or other data files) for the task.",
-    )
-    parser.add_argument(
-        "--model_type",
-        default=None,
-        type=str,
-        required=True,
-        help="Model type selected in the list: " + ", ".join(MODEL_CLASSES.keys()),
-    )
-    parser.add_argument(
-        "--classifier_type",
-        default=None,
-        type=str,
-        required=False,
-        help="Model type selected in the list: " + ", ".join(['FC', '2FC', 'FC-RelU', 'FC-Tanh', 'FC-DO']),
-    )
-    parser.add_argument(
-        "--model_name_or_path",
-        default=None,
-        type=str,
-        required=True,
-        help="Path to pre-trained model or shortcut name selected in the list: " + ", ".join(ALL_MODELS),
-    )
-    parser.add_argument(
-        "--task_name",
-        default=None,
-        type=str,
-        required=True,
-        help="The name of the task to train selected in the list: " + ", ".join(processors.keys()),
-    )
-    parser.add_argument(
-        "--output_dir",
-        default=None,
-        type=str,
-        required=True,
-        help="The output directory where the model predictions and checkpoints will be written.",
     )
 
     # Other parameters
@@ -482,13 +677,7 @@ def main():
         type=str,
         help="Where do you want to store the pre-trained models downloaded from s3",
     )
-    parser.add_argument(
-        "--max_seq_length",
-        default=128,
-        type=int,
-        help="The maximum total input sequence length after tokenization. Sequences longer "
-        "than this will be truncated, sequences shorter will be padded.",
-    )
+
     parser.add_argument("--do_train", action="store_true", help="Whether to run training.")
     parser.add_argument("--do_eval", action="store_true", help="Whether to run eval on the dev set.")
     parser.add_argument(
@@ -510,13 +699,9 @@ def main():
         default=1,
         help="Number of updates steps to accumulate before performing a backward/update pass.",
     )
-    parser.add_argument("--learning_rate", default=5e-5, type=float, help="The initial learning rate for Adam.")
-    parser.add_argument("--weight_decay", default=0.0, type=float, help="Weight decay if we apply some.")
     parser.add_argument("--adam_epsilon", default=1e-8, type=float, help="Epsilon for Adam optimizer.")
     parser.add_argument("--max_grad_norm", default=1.0, type=float, help="Max gradient norm.")
-    parser.add_argument(
-        "--num_train_epochs", default=3.0, type=float, help="Total number of training epochs to perform.",
-    )
+
     parser.add_argument(
         "--max_steps",
         default=-1,
@@ -525,7 +710,7 @@ def main():
     )
     parser.add_argument("--warmup_steps", default=0, type=int, help="Linear warmup over warmup_steps.")
 
-    parser.add_argument("--logging_steps", type=int, default=50, help="Log every X updates steps.")
+    parser.add_argument("--logging_steps", type=int, default=200, help="Log every X updates steps.")
     parser.add_argument("--save_steps", type=int, default=50, help="Save checkpoint every X updates steps.")
     parser.add_argument(
         "--eval_all_checkpoints",
@@ -634,7 +819,8 @@ def main():
         do_lower_case=args.do_lower_case,
         cache_dir=args.cache_dir if args.cache_dir else None,
     )
-    if args.task_name == "cdcp_relclass_rbert":
+
+    if args.task_name in ["cdcp_relclass_rbert", "cdcp_relclass_rbert_jl"]:
         tokenizer.add_special_tokens({"additional_special_tokens": ADDITIONAL_SPECIAL_TOKENS})
 
     model = model_class.from_pretrained(
@@ -642,8 +828,14 @@ def main():
         from_tf=bool(".ckpt" in args.model_name_or_path),
         config=config,
         cache_dir=args.cache_dir if args.cache_dir else None,
-        classifier_type=args.classifier_type if args.classifier_type else None
+        classifier_type=args.classifier_type if args.classifier_type else None,
+        loss_weights=args.loss_weights,
+        final_evaluation=False
     )
+
+    if args.freeze_bert == 1:
+        for param in model.bert.parameters():
+            param.requires_grad = False
 
     if args.local_rank == 0:
         torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
@@ -654,8 +846,8 @@ def main():
 
     # Training
     if args.do_train:
-        train_dataset = load_and_cache_examples(args, args.task_name, tokenizer, evaluate=False)
-        global_step, tr_loss = train(args, train_dataset, model, tokenizer)
+        train_dataset = load_and_cache_examples(args, args.task_name, tokenizer, dataset_type='train')
+        global_step, tr_loss, tb_writer = train(args, train_dataset, model, tokenizer)
         logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
 
     # Saving best-practices: if you use defaults names for the model, you can reload it using from_pretrained()
@@ -678,7 +870,9 @@ def main():
 
         # Load a trained model and vocabulary that you have fine-tuned
         model = model_class.from_pretrained(args.output_dir,
-                                            classifier_type=args.classifier_type if args.classifier_type else None)
+                                            classifier_type=args.classifier_type if args.classifier_type else None,
+                                            loss_weights=args.loss_weights,
+                                            final_evaluation=False)
         tokenizer = tokenizer_class.from_pretrained(args.output_dir)
         model.to(args.device)
 
@@ -686,6 +880,9 @@ def main():
     results = {}
     if args.do_eval and args.local_rank in [-1, 0]:
         tokenizer = tokenizer_class.from_pretrained(args.output_dir, do_lower_case=args.do_lower_case)
+        if args.task_name in ["cdcp_relclass_rbert", "cdcp_relclass_rbert_jl"]:
+            tokenizer.add_special_tokens({"additional_special_tokens": ADDITIONAL_SPECIAL_TOKENS})
+
         checkpoints = [args.output_dir]
         if args.eval_all_checkpoints:
             checkpoints = list(
@@ -698,12 +895,29 @@ def main():
             prefix = checkpoint.split("/")[-1] if checkpoint.find("checkpoint") != -1 else ""
 
             model = model_class.from_pretrained(checkpoint,
-                                                classifier_type=args.classifier_type if args.classifier_type else None)
+                                                classifier_type=args.classifier_type if args.classifier_type else None,
+                                                loss_weights=args.loss_weights,
+                                                final_evaluation=args.final_evaluation == 1)
             model.to(args.device)
-            result = evaluate(args, model, tokenizer, prefix=prefix)
+            result = evaluate(args, model, tokenizer, prefix=prefix, dataset_type='dev')
             result = dict((k + "_{}".format(global_step), v) for k, v in result.items())
             results.update(result)
 
+        # Do cool logging stuff
+        if args.do_train and args.local_rank in [-1, 0]:
+            r = dict(results)
+            if args.output_mode != SEQUENCE_TAGGING:
+                del r['clf_report_']
+            param_dict = {"model_type": args.model_type, "task_name": args.task_name,
+                          "classifier_type": str(args.classifier_type),
+                          "max_seq_length": args.max_seq_length, "learning_rate": args.learning_rate,
+                          "weight_decay": args.weight_decay,
+                          "freeze_bert": args.freeze_bert, "epochs": args.num_train_epochs,
+                          "batch_size": args.train_batch_size,
+                          "loss_weight_0": args.loss_weights[0], "loss_weight_1": args.loss_weights[1],
+                          "loss_weight_2": args.loss_weights[2]}
+            tb_writer.add_hparams(param_dict, r)
+            tb_writer.close()
     return results
 
 
