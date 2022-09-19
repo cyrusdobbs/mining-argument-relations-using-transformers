@@ -4,4 +4,4 @@ The code runs under Python 3.6 or higher. The required packages are listed in th
 
 See https://github.com/huggingface/transformers for more details.
 
-See MiningArgumentRelationsUsingTransformers.pdf for the written Thesis.
+See [MiningArgumentRelationsUsingTransformers.pdf](https://github.com/CyrusDobbs/mining-argument-relations-using-transformers/blob/main/MiningArgumentRelationsUsingTransformers.pdf) for the written Thesis.
